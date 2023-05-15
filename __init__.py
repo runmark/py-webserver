@@ -1,6 +1,10 @@
+import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 import logging
+import mimetypes
+import os
+import re
 
 import urllib.parse
 
@@ -9,7 +13,9 @@ class RequestDispatcher(BaseHTTPRequestHandler):
     def __init__(self, request, client_address, server):
         self._middlewares = [
             ServerHeader(),
-            Index(),
+            routing,
+            StaticFile(os.path.dirname(__file__) + "/static"),
+            # Index(),
             NotFound(),
         ]
         self._catchall = GenericError()
@@ -63,7 +69,7 @@ class Request:
 class Response:
     """Provide interface to write HTTP response
 
-    Some method return self in order to implement chain invoke.
+    Some method return self in order to implement chain invoke
     """
 
     def __init__(self, handler: BaseHTTPRequestHandler):
@@ -121,6 +127,97 @@ class NotFound(Middleware):
     def handle(self, ctx: HttpContext) -> bool:
         ctx.response.status(404).html("<h1>File Not Found</h1>")
         return True
+
+
+class Routing(Middleware):
+    def __init__(self):
+        self._routes = []
+
+    def handle(self, ctx: HttpContext) -> bool:
+        for pattern, handler in self._routes:
+            kwargs = self.match(ctx.request.path, pattern)
+            if kwargs is not None:
+                handler(ctx.request, ctx.response, **kwargs)
+                return True
+        return False
+
+    def match(self, url_path: str, pattern: str) -> dict:
+        re_pattern = "^" + re.sub(r"<(\w+)>", r"(?P<\1>\\w+)", pattern) + "$"
+        m = re.match(re_pattern, url_path)
+        return m.groupdict() if m else None
+
+    def route(self, path: str):
+        def wrapper(func):
+            self._routes.append((path, func))
+            return func
+
+        return wrapper
+
+
+routing = Routing()
+
+
+@routing.route("/")
+def index(req, resp):
+    resp.html("<h1>Index</h1>")
+
+
+@routing.route("/user/<name>")
+def username(req, resp, name):
+    resp.html(f"<h1>Hello {name}!</h1>")
+
+
+class StaticFile(Middleware):
+    def __init__(self, root_path: str):
+        self._root_path = root_path
+
+    def handle(self, ctx: HttpContext) -> bool:
+        full_path = os.path.normpath(self._root_path + ctx.request.path)
+        if os.path.isfile(full_path):
+            self.send_file(ctx.response, full_path)
+            return True
+        elif os.path.isdir(full_path):
+            if self.process_index(ctx.response, full_path):
+                return True
+            else:
+                html = self.build_dir_html(full_path)
+                ctx.response.html(html)
+                return True
+        return False
+
+    def send_file(self, response: Response, file_path: str):
+        content_type = mimetypes.guess_type(file_path)[0] or "application/octec-stream"
+        with open(file_path, "rb") as f:
+            response.header("Content-Type", content_type).data(f.read())
+
+    def process_index(self, resp: Response, dir_path: str):
+        index_names = ["index.html", "index.htm", "default.html", "default.htm"]
+        for name in index_names:
+            index_path = os.path.join(dir_path, name)
+            if os.path.isfile(index_path):
+                self.send_file(resp, index_path)
+                return True
+        return False
+
+    def build_dir_html(self, dir_path: str):
+        lines = []
+        lines.append(f"<h1>Directory of {os.path.split(dir_path)[1]}:</h1>")
+        lines.append("<hr/>")
+        lines.append("<table>")
+        lines.append("<thead><tr><th>Name</th><th>Size</th><th>Time</th></tr></thead>")
+        lines.append("<tbody>")
+        for file_name in os.listdir(dir_path):
+            full_path = os.path.join(dir_path, file_name)
+            lines.append("<tr>")
+            lines.append(f"<td>{file_name}</td>")
+            stat = os.stat(full_path)
+            size_str = str(stat.st_size) if os.path.isfile(full_path) else ""
+            lines.append(f"<td>{size_str}</td>")
+            lines.append(f"<td>{datetime.fromtimestamp(stat.st_mtime)}</td>")
+            lines.append("</tr>")
+        lines.append("</tbody>")
+        lines.append("</table>")
+        return "\n".join(lines)
 
 
 class Index(Middleware):
